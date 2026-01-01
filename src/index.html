@@ -1,32 +1,207 @@
 <!DOCTYPE html>
-<html lang="en">
-    <head>
-        <meta charset="UTF-8" />
-        <link rel="stylesheet" href="styles.css" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>PakePlus App</title>
-        <script type="module" src="/main.js" defer></script>
-    </head>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>交互式气泡钢琴</title>
+    <style>
+        :root {
+            --key-bg: #fff;
+            --key-active: #00d2ff;
+            --pipe-bg: #1a1a1a;
+        }
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            overflow: hidden; background: #050505; font-family: sans-serif;
+        }
 
-    <body>
-        <main class="container">
-            <h1>Welcome to PakePlus</h1>
-            <form class="row" id="greet-form">
-                <input id="inputValue" placeholder="Enter a something..." />
-            </form>
-            <div class="resultBox">
-                <span>result: </span>
-                <span id="result"></span>
-            </div>
-            <div class="invokeBox">
-                <button id="openUrl">open_url_browser</button>
-                <button id="openUrlNew">open_url_new</button>
-                <button id="runCommand">run_command</button>
-                <button id="downloadFile">download_file</button>
-                <button id="getExeDir">get_exe_dir</button>
-                <button id="getEnvVar">get_env_var</button>
-                <button id="findPort">find_port</button>
-            </div>
-        </main>
-    </body>
+        /* 上部气泡区域 */
+        #visualizer {
+            width: 100%; height: 75vh;
+            display: block; background: linear-gradient(to top, #0a0a0a, #000);
+        }
+
+        /* 键盘区域 */
+        #keyboard {
+            width: 100%; height: 25vh;
+            display: flex; background: #000;
+            border-top: 2px solid #333;
+        }
+
+        .key {
+            flex: 1; margin: 0 1px;
+            background: var(--key-bg);
+            border-radius: 0 0 5px 5px;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: flex-end;
+            padding-bottom: 15px; cursor: pointer;
+            transition: all 0.1s; position: relative;
+            user-select: none;
+        }
+
+        .key:active, .key.active {
+            background: var(--key-active);
+            box-shadow: 0 0 20px var(--key-active);
+            transform: translateY(2px);
+        }
+
+        .key .note { font-weight: bold; font-size: 1.2rem; color: #333; }
+        .key .hint { font-size: 0.8rem; color: #666; margin-top: 5px; }
+
+        /* 黑色管道背景 */
+        .pipes-container {
+            position: absolute; top: 0; left: 0; width: 100%; height: 75vh;
+            display: flex; pointer-events: none; z-index: 1;
+        }
+        .pipe {
+            flex: 1; margin: 0 1px;
+            background: rgba(20, 20, 20, 0.4);
+            border-left: 1px solid rgba(255,255,255,0.05);
+        }
+    </style>
+</head>
+<body>
+
+<div class="pipes-container" id="pipes"></div>
+<canvas id="visualizer"></canvas>
+<div id="keyboard" id="keys"></div>
+
+<script>
+    // 1. 音频上下文配置
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // 音符数据映射 (C4调)
+    // 频率对应：~(-7), 1(C), 2(D), 3(E), 4(F), 5(G), 6(A), 7(B), 8(C5), 9(D5)...
+    const noteMap = [
+        { key: '`', note: '-7', freq: 246.94 }, // B3
+        { key: '1', note: '1', freq: 261.63 }, // C4
+        { key: '2', note: '2', freq: 293.66 }, // D4
+        { key: '3', note: '3', freq: 329.63 }, // E4
+        { key: '4', note: '4', freq: 349.23 }, // F4
+        { key: '5', note: '5', freq: 392.00 }, // G4
+        { key: '6', note: '6', freq: 440.00 }, // A4
+        { key: '7', note: '7', freq: 493.88 }, // B4
+        { key: '8', note: '8', freq: 523.25 }, // C5
+        { key: '9', note: '9', freq: 587.33 }, // D5
+        { key: '0', note: '0', freq: 659.25 }, // E5
+        { key: '-', note: '-', freq: 698.46 }, // F5
+        { key: '=', note: '=', freq: 783.99 }  // G5
+    ];
+
+    const canvas = document.getElementById('visualizer');
+    const ctx = canvas.getContext('2d');
+    const keyboard = document.getElementById('keyboard');
+    const pipesContainer = document.getElementById('pipes');
+    let bubbles = [];
+
+    // 初始化页面布局
+    function init() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight * 0.75;
+
+        noteMap.forEach((item, index) => {
+            // 创建键盘
+            const keyEl = document.createElement('div');
+            keyEl.className = 'key';
+            keyEl.id = `key-${item.key}`;
+            keyEl.innerHTML = `<span class="note">${item.note}</span><span class="hint">${item.key}</span>`;
+            keyEl.onmousedown = () => playNote(item, index);
+            keyboard.appendChild(keyEl);
+
+            // 创建管道背景
+            const pipe = document.createElement('div');
+            pipe.className = 'pipe';
+            pipesContainer.appendChild(pipe);
+        });
+    }
+
+    // 2. 钢琴声发生器
+    function playNote(item, index) {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        osc.type = 'triangle'; // 类似钢琴的柔和三角波
+        osc.frequency.setValueAtTime(item.freq, audioCtx.currentTime);
+
+        gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 1.5);
+
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        osc.start();
+        osc.stop(audioCtx.currentTime + 1.5);
+
+        // 触发气泡
+        createBubble(index);
+        
+        // 视觉反馈
+        const el = document.getElementById(`key-${item.key}`);
+        el.classList.add('active');
+        setTimeout(() => el.classList.remove('active'), 150);
+    }
+
+    // 3. 气泡动画逻辑
+    class Bubble {
+        constructor(index) {
+            const keyWidth = window.innerWidth / noteMap.length;
+            this.x = (index * keyWidth) + (keyWidth / 2);
+            this.y = canvas.height;
+            this.radius = Math.random() * 15 + 10;
+            this.speed = Math.random() * 2 + 1;
+            this.opacity = 1;
+            this.drift = (Math.random() - 0.5) * 1;
+        }
+
+        update() {
+            this.y -= this.speed;
+            this.x += this.drift;
+            this.opacity -= 0.005;
+        }
+
+        draw() {
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(0, 210, 255, ${this.opacity})`;
+            ctx.shadowBlur = 15;
+            ctx.shadowColor = '#00d2ff';
+            ctx.fill();
+            ctx.closePath();
+        }
+    }
+
+    function createBubble(index) {
+        bubbles.push(new Bubble(index));
+    }
+
+    function animate() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        bubbles = bubbles.filter(b => b.opacity > 0);
+        bubbles.forEach(b => {
+            b.update();
+            b.draw();
+        });
+        requestAnimationFrame(animate);
+    }
+
+    // 4. 键盘事件监听
+    window.addEventListener('keydown', (e) => {
+        const item = noteMap.find(n => n.key === e.key);
+        if (item) {
+            const index = noteMap.indexOf(item);
+            playNote(item, index);
+        }
+    });
+
+    window.addEventListener('resize', () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight * 0.75;
+    });
+
+    init();
+    animate();
+</script>
+</body>
 </html>
